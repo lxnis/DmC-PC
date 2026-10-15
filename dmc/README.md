@@ -42,7 +42,7 @@ All in `dmc/dmc_windows_patch.py` (already applied in this branch; marked `bbpor
 In the **MSYS2 CLANG64** shell, with the packages from `packaging/windows/README.md`:
 
 ```bash
-git clone -b dmc https://github.com/<you>/CTR-NitroFueled-PC
+git clone -b dmc https://github.com/lxnis/CTR-NitroFueled-PC
 cd CTR-NitroFueled-PC
 git submodule update --init --recursive
 bash build.sh                       # out/sacredfire.exe
