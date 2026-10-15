@@ -23,6 +23,21 @@
 #include <asm/prctl.h>
 #endif
 #define ERR(n) ((int32_t)(UINT32_C(0x80020000)|(n)))
+#ifdef _WIN32
+/* bbport-dmc-timer: Windows times out every wait (winpthreads condition variables and semaphores,
+ * WaitForSingleObject) on the system timer tick, 15.6 ms unless a process asks for less. DmC's
+ * Bink cutscenes wait in short timed steps: on the default tick a frame took ~156 ms (8 FPS, GPU
+ * idle) while gameplay ran at 150 FPS. timeBeginPeriod(1) makes the tick 1 ms for this process,
+ * as games and emulators do. BB_TIMER_1MS=0 leaves the system default (A/B). */
+__attribute__((constructor)) static void dmc_timer_resolution(void) {
+    const char *env = getenv("BB_TIMER_1MS");
+    if (env && env[0] == '0') { printf("Runtime: Windows timer resolution left at the default (BB_TIMER_1MS=0)\n"); return; }
+    HMODULE winmm = LoadLibraryA("winmm.dll");
+    typedef UINT (WINAPI *TimeBeginPeriod)(UINT);
+    TimeBeginPeriod begin = winmm ? (TimeBeginPeriod)(void *)GetProcAddress(winmm, "timeBeginPeriod") : NULL;
+    printf("Runtime: Windows timer resolution 1 ms: %s\n", begin && begin(1) == 0 ? "on" : "not available");
+}
+#endif
 #define ATTR_MAGIC UINT32_C(0x41545452)
 #define STACK_MARGIN (256*1024)
 #define MIN_STACK (64*1024)
@@ -37,6 +52,10 @@ typedef struct ThreadAttr {
     struct ThreadAttr *next;
 } ThreadAttr;
 typedef struct GuestThread {
+    /* bbport-dmc: first field = thread id, as FreeBSD's struct pthread (long tid). Guest code
+     * reads it straight from the handle (UE3: ThreadID = *(int *)handle after scePthreadCreate),
+     * so it must equal scePthreadGetthreadid() and be set before the thread is created. */
+    int64_t tid;
     /* Guest-visible TCB is allocated separately; this is the ScePthread handle. */
     uint64_t *tcb;
     unsigned char *tls_block;
@@ -105,9 +124,11 @@ static void attach(GuestThread *t) {
     set_gs(tcb);
     current=t;
 }
+static int64_t next_tid=100000; /* bbport-dmc: FreeBSD thread ids start at 100000 */
 static GuestThread *new_thread(void) {
     GuestThread *t=calloc(1,sizeof(*t));
     if (!t) return NULL;
+    t->tid=__atomic_fetch_add(&next_tid,1,__ATOMIC_RELAXED);
     t->attr=(ThreadAttr){.magic=ATTR_MAGIC,.policy=1,.prio=DEFAULT_PRIO,.stack=DEFAULT_STACK,.affinity=0x7f};
     return t;
 }
@@ -361,11 +382,8 @@ static ABI int32_t thread_getname(GuestThread *t,char *name) {
     if (!name) return ERR(22);
     memcpy(name,t->name,sizeof(t->name)); return 0;
 }
-#ifdef _WIN32
-static ABI int32_t thread_getthreadid(void) { return (int32_t)compat_thread_id(); }
-#else
-static ABI int32_t thread_getthreadid(void) { return (int32_t)syscall(SYS_gettid); }
-#endif
+/* bbport-dmc: the guest thread id (first field of the ScePthread handle), not the host's. */
+static ABI int32_t thread_getthreadid(void) { return (int32_t)runtime_thread_current()->tid; }
 /* Deferred cancellation: a thread without cancellation points keeps running, as on the console; the
  * request is noted so the caller sees success. No guest thread of this game is expected to reach a
  * cancellation point; a cancel that must take effect would need the point implemented. */
@@ -388,6 +406,13 @@ static ABI int32_t posix_setschedparam(GuestThread *t,int32_t policy,const Guest
     if (!param || policy<1 || policy>3) return 22;
     t->attr.policy=policy; t->attr.prio=param->priority; return 0;
 }
+/* bbport-dmc: the scePthread* versions: same behaviour, SCE error codes (0x80020000 + errno). */
+static ABI int32_t sce_getschedparam(GuestThread *t,int32_t *policy,GuestSchedParam *param) {
+    const int32_t e=posix_getschedparam(t,policy,param); return e ? ERR(e) : 0;
+}
+static ABI int32_t sce_setschedparam(GuestThread *t,int32_t policy,const GuestSchedParam *param) {
+    const int32_t e=posix_setschedparam(t,policy,param); return e ? ERR(e) : 0;
+}
 
 /* POSIX (libScePosix) variants return positive errno values. */
 static int32_t posix(int32_t r) { return r ? (int32_t)((uint32_t)r&0xffff) : 0; }
@@ -400,6 +425,156 @@ static ABI int32_t posix_create(GuestThread **t,ThreadAttr **a,GuestEntry e,void
 static ABI int32_t posix_create_name(GuestThread **t,ThreadAttr **a,GuestEntry e,void *arg,const char *name) { return posix(create(t,a,e,arg,name)); }
 static ABI int32_t posix_join(GuestThread *t,void **r) { return posix(thread_join(t,r)); }
 
+#ifdef _WIN32
+/* bbport-dmc-sampler4: BB_SAMPLE=1 (Windows; Linux has BB_SAMPLE_THREAD). Every millisecond each
+ * guest thread is suspended for a moment: its instruction pointer and, from a scan of its stack,
+ * the nearest return addresses into sacredfire.exe (the port) and into the game are noted. Every
+ * 5 s: per thread, the share of time in game code and blocked in the kernel; then the hottest
+ * (thread, where, port caller, game caller) entries. Host code: module+offset (llvm-symbolizer
+ * --relative-address for sacredfire.exe); game code: guest+offset from 0x800000000. */
+enum { DMC_SLOTS = 8192, DMC_TOP = 40, DMC_NAMES = 64, DMC_SCAN = 1024 };
+typedef struct { uint64_t rip, host, host2, guest, guest2, guest3; uint32_t count; char name[24]; } DmcSample;
+static DmcSample dmc_samples[DMC_SLOTS];
+static uint64_t dmc_exe_lo, dmc_exe_hi;
+static int dmc_is_guest(uint64_t a) { return a >= 0x800000000ull && a < 0x810000000ull; }
+/* Guest code: the eboot's text and the linked modules (libc, Fios2, NTJobCode) after 0x4260000. */
+static int dmc_is_guest_code(uint64_t a) {
+    const uint64_t o = a - 0x800000000ull;
+    return a >= 0x800000000ull && ((o >= 0x1000ull && o < 0x2f7c000ull) || (o >= 0x4260000ull && o < 0x4800000ull));
+}
+/* A plausible return address: the bytes before it are a call (e8 rel32, ff /2 forms). */
+static int dmc_after_call(uint64_t a) {
+    /* Read through ReadProcessMemory: a stale stack value may point at an unmapped page. */
+    unsigned char bytes[8];
+    SIZE_T got = 0;
+    if (!ReadProcessMemory(GetCurrentProcess(), (LPCVOID)(uintptr_t)(a - 8), bytes, 8, &got) || got != 8) return 0;
+    const unsigned char *p = bytes + 8;
+    if (p[-5] == 0xe8) return 1;
+    if (p[-2] == 0xff && (p[-1] & 0xf8) == 0xd0) return 1;                 /* call reg */
+    if (p[-2] == 0xff && (p[-1] & 0xf8) == 0x10 && (p[-1] & 7) != 4 && (p[-1] & 7) != 5) return 1; /* call [reg] */
+    if (p[-3] == 0xff && (p[-2] & 0xf8) == 0x50) return 1;                 /* call [reg+d8] */
+    if (p[-6] == 0xff && (p[-5] == 0x15 || (p[-5] & 0xf8) == 0x90)) return 1; /* call [rip+d32] / [reg+d32] */
+    if (p[-3] == 0x41 && p[-2] == 0xff && (p[-1] & 0xf8) == 0xd0) return 1; /* call r8-r15 */
+    return 0;
+}
+static void dmc_where(uint64_t rip, char *out, size_t size) {
+    HMODULE m = NULL;
+    if (!rip) { snprintf(out, size, "-"); return; }
+    if (dmc_is_guest(rip)) { snprintf(out, size, "guest+0x%llx", (unsigned long long)(rip - 0x800000000ull)); return; }
+    if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                           (LPCSTR)(uintptr_t)rip, &m) && m) {
+        char path[MAX_PATH] = "?";
+        GetModuleFileNameA(m, path, sizeof(path));
+        const char *base = strrchr(path, '\\');
+        snprintf(out, size, "%s+0x%llx", base ? base + 1 : path, (unsigned long long)(rip - (uint64_t)(uintptr_t)m));
+    } else {
+        snprintf(out, size, "0x%llx", (unsigned long long)rip);
+    }
+}
+static int dmc_cmp(const void *a, const void *b) {
+    const DmcSample *x = a, *y = b;
+    return x->count < y->count ? 1 : x->count > y->count ? -1 : 0;
+}
+static void dmc_report(uint64_t total) {
+    static DmcSample sorted[DMC_SLOTS];
+    struct { char name[24]; uint32_t count, guest, kernel; } names[DMC_NAMES];
+    int nnames = 0, n = 0;
+    for (int i = 0; i < DMC_SLOTS; ++i) {
+        if (!dmc_samples[i].count) continue;
+        sorted[n++] = dmc_samples[i];
+        int k = 0;
+        while (k < nnames && strcmp(names[k].name, dmc_samples[i].name)) ++k;
+        if (k == nnames && nnames < DMC_NAMES) { memset(&names[k], 0, sizeof(names[k])); memcpy(names[k].name, dmc_samples[i].name, 24); ++nnames; }
+        if (k < nnames) {
+            char where[160]; dmc_where(dmc_samples[i].rip, where, sizeof(where));
+            names[k].count += dmc_samples[i].count;
+            if (!strncmp(where, "guest+", 6)) names[k].guest += dmc_samples[i].count;
+            if (!strncmp(where, "ntdll", 5) || !strncmp(where, "win32u", 6) || !strncmp(where, "KERNELBASE", 10)) names[k].kernel += dmc_samples[i].count;
+        }
+    }
+    qsort(sorted, n, sizeof(*sorted), dmc_cmp);
+    printf("Sampler: %llu samples in 5 s (1 per ms per guest thread)\n", (unsigned long long)total);
+    for (int k = 0; k < nnames; ++k)
+        if (names[k].count * 50 >= total / 10)
+            printf("Sampler thread %-24s %6u samples: guest code %3u%%, blocked in the kernel %3u%%\n", names[k].name,
+                   names[k].count, names[k].guest * 100 / names[k].count, names[k].kernel * 100 / names[k].count);
+    for (int i = 0; i < n && i < DMC_TOP; ++i) {
+        char where[160], host[160], host2[160], guest[48], guest2[48], guest3[48];
+        dmc_where(sorted[i].rip, where, sizeof(where));
+        dmc_where(sorted[i].host, host, sizeof(host));
+        dmc_where(sorted[i].host2, host2, sizeof(host2));
+        dmc_where(sorted[i].guest, guest, sizeof(guest));
+        dmc_where(sorted[i].guest2, guest2, sizeof(guest2));
+        dmc_where(sorted[i].guest3, guest3, sizeof(guest3));
+        printf("Sampler hot %2d: %6u  %-20s %-24s port %s < %s  game %s < %s < %s\n", i + 1, sorted[i].count,
+               sorted[i].name, where, host, host2, guest, guest2, guest3);
+    }
+    fflush(stdout);
+    memset(dmc_samples, 0, sizeof(dmc_samples));
+}
+static DWORD WINAPI dmc_sampler(void *arg) {
+    (void)arg;
+    static uint64_t stack[DMC_SCAN];
+    HMODULE exe = GetModuleHandleA(NULL);
+    const IMAGE_DOS_HEADER *dos = (const IMAGE_DOS_HEADER *)exe;
+    const IMAGE_NT_HEADERS *nt = (const IMAGE_NT_HEADERS *)((const char *)exe + dos->e_lfanew);
+    dmc_exe_lo = (uint64_t)(uintptr_t)exe;
+    dmc_exe_hi = dmc_exe_lo + nt->OptionalHeader.SizeOfImage;
+    uint64_t total = 0;
+    ULONGLONG last = GetTickCount64();
+    for (;;) {
+        Sleep(1);
+        pthread_mutex_lock(&lock);
+        for (GuestThread *t = threads; t; t = t->next) {
+            if (t->finished) continue;
+            HANDLE h = (HANDLE)pthread_gethandle(t->host);
+            if (!h || GetThreadId(h) == GetCurrentThreadId()) continue;
+            if (SuspendThread(h) == (DWORD)-1) continue;
+            CONTEXT c; memset(&c, 0, sizeof(c)); c.ContextFlags = CONTEXT_CONTROL;
+            BOOL ok = GetThreadContext(h, &c);
+            uint64_t host = 0, host2 = 0, guest = 0, guest2 = 0, guest3 = 0;
+            if (ok) {
+                SIZE_T got = 0;
+                ReadProcessMemory(GetCurrentProcess(), (LPCVOID)(uintptr_t)c.Rsp, stack, sizeof(stack), &got);
+                const uint64_t rip = c.Rip;
+                if (rip >= dmc_exe_lo && rip < dmc_exe_hi) host = rip;
+                if (dmc_is_guest_code(rip)) guest = rip;
+                for (SIZE_T i = 0; i < got / 8 && (!host2 || !guest3); ++i) {
+                    const uint64_t v = stack[i];
+                    if (v >= dmc_exe_lo + 0x1000 && v < dmc_exe_hi && dmc_after_call(v)) {
+                        if (!host) host = v; else if (!host2 && v != host) host2 = v;
+                    } else if (dmc_is_guest_code(v) && dmc_after_call(v)) {
+                        if (!guest) guest = v; else if (!guest2) guest2 = v; else if (!guest3) guest3 = v;
+                    }
+                }
+            }
+            ResumeThread(h);
+            if (!ok) continue;
+            const uint64_t rip = c.Rip;
+            uint32_t hash = (uint32_t)(((rip ^ (host << 7) ^ (host2 << 3) ^ (guest << 13) ^ (guest2 << 17) ^ (guest3 << 21)) * 0x9E3779B97F4A7C15ull) >> 40);
+            for (const char *q = t->name; *q; ++q) hash = hash * 31u + (unsigned char)*q;
+            for (uint32_t i = 0; i < DMC_SLOTS; ++i) {
+                DmcSample *e = &dmc_samples[(hash + i) % DMC_SLOTS];
+                if (!e->count) { e->rip = rip; e->host = host; e->host2 = host2; e->guest = guest; e->guest2 = guest2; e->guest3 = guest3;
+                                 snprintf(e->name, sizeof(e->name), "%s", t->name); }
+                if (e->rip == rip && e->host == host && e->host2 == host2 && e->guest == guest && e->guest2 == guest2 && e->guest3 == guest3 &&
+                    !strncmp(e->name, t->name, sizeof(e->name) - 1)) { ++e->count; break; }
+            }
+            ++total;
+        }
+        pthread_mutex_unlock(&lock);
+        if (GetTickCount64() - last >= 5000) { dmc_report(total); total = 0; last = GetTickCount64(); }
+    }
+    return 0;
+}
+__attribute__((constructor)) static void dmc_sampler_start(void) {
+    const char *env = getenv("BB_SAMPLE");
+    if (env && env[0] == '1') {
+        printf("Runtime: CPU sampler on (BB_SAMPLE=1): a report every 5 s\n");
+        CreateThread(NULL, 0, dmc_sampler, NULL, 0, NULL);
+    }
+}
+#endif
 uintptr_t runtime_thread_resolve(const char *name) {
     static const struct { const char *nid; void *fn; } table[]={
         {"aI+OeCz8xrQ#libkernel",thread_self}, {"EotR8a3ASf4",thread_self},
@@ -423,6 +598,7 @@ uintptr_t runtime_thread_resolve(const char *name) {
         {"FJrT5LuUBAU",thread_exit},
         {"How7B8Oet6k#libkernel",thread_getname}, {"EI-5-jlq2dE#libkernel",thread_getthreadid}, {"qBDmpCyGssE#libkernel",thread_cancel},
         {"FIs3-UQT9sg",posix_getschedparam}, {"Xs9hdiD7sAA",posix_setschedparam},
+        {"P41kTWUS3EI#libkernel",sce_getschedparam}, {"oIRFTjoILbg#libkernel",sce_setschedparam}, /* bbport-dmc */
     };
     for (size_t i=0;i<sizeof(table)/sizeof(*table);++i)
         if (runtime_nid_equals(name,table[i].nid)) return (uintptr_t)table[i].fn;

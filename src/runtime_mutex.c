@@ -176,6 +176,16 @@ static int32_t cond_wait_until(GuestCond **cond, GuestMutex **mutex, const struc
     if (e) return e;
     if (!mutex || (uintptr_t)*mutex < 3 || !end) return orbis_error(EINVAL);
     ++waits;
+#ifdef _WIN32
+    /* bbport-dmc-condpoll: a deadline already past times out at once (winpthreads would still
+     * wait for a timer tick, 10-16 ms). */
+    {
+        struct timespec now;
+        clock_gettime(CLOCK_REALTIME, &now);
+        if (now.tv_sec > end->tv_sec || (now.tv_sec == end->tv_sec && now.tv_nsec >= end->tv_nsec))
+            return timed_error(ETIMEDOUT);
+    }
+#endif
     const uint64_t start = runtime_wait_clock();
     const int e2 = pthread_cond_timedwait(&(*cond)->native, &(*mutex)->native, end);
     runtime_wait_note(0, runtime_wait_clock() - start);

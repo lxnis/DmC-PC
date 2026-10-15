@@ -428,7 +428,265 @@ static int condattr_marker;
 static ABI int32_t condattr_init(void **attr) { if (!attr) return ERR(22); *attr=&condattr_marker; return 0; }
 static ABI int32_t condattr_destroy(void **attr) { if (!attr || !*attr) return ERR(22); *attr=NULL; return 0; }
 
+/* ---- bbport-dmc: DmC Definitive Edition (Unreal Engine 3) ---- */
+/* sceKernelSetVirtualRangeName(addr, len, name): names a memory range for Sony's debug tools only;
+ * nothing changes, so it is logged and succeeds. */
+static ABI int32_t kernel_set_virtual_range_name(const void *addr, size_t len, const char *name) {
+    static int reported;
+    if (reported < 8) {
+        reported++;
+        printf("Runtime: sceKernelSetVirtualRangeName(%p, 0x%zx, \"%s\") -> 0\n",
+               addr, len, name ? name : "(null)");
+    }
+    return 0;
+}
+/* sceKernelLoadStartModule(path, args, argp, flags, opt, result): the game's modules are linked
+ * into the image by link_modules.py, so nothing is loaded. A PS4 module handle is positive;
+ * *result is module_start's return value (0 = success). */
+static ABI int32_t kernel_load_start_module(const char *path, size_t args, const void *argp,
+                                            uint32_t flags, const void *opt, int32_t *result) {
+    static int32_t next_handle = 0x100;
+    (void)args; (void)argp; (void)opt;
+    const int32_t handle = next_handle++;
+    printf("Runtime: sceKernelLoadStartModule(\"%s\", flags=0x%x) -> handle 0x%x (linked)\n",
+           path ? path : "(null)", flags, handle);
+    if (result) *result = 0;
+    return handle;
+}
+/* POSIX semaphores: the guest's sem_t holds a pointer to a host semaphore (winpthreads on
+ * Windows, glibc on Linux). */
+#include <semaphore.h>
+typedef struct { int64_t sec, nsec; } DmcGuestTimespec;   /* FreeBSD x86-64 struct timespec */
+static sem_t *guest_sem(void *sem) { return sem ? *(sem_t **)sem : NULL; }
+static ABI int32_t posix_sem_init(void *sem, int32_t pshared, uint32_t value) {
+    (void)pshared;
+    if (!sem) return fail_posix(EINVAL);
+    sem_t *host = malloc(sizeof(sem_t));
+    if (!host) return fail_posix(ENOMEM);
+    if (sem_init(host, 0, value)) { const int e = errno; free(host); return fail_posix(e); }
+    *(sem_t **)sem = host;
+    return 0;
+}
+static ABI int32_t posix_sem_destroy(void *sem) {
+    sem_t *host = guest_sem(sem);
+    if (!host) return fail_posix(EINVAL);
+    sem_destroy(host);
+    free(host);
+    *(sem_t **)sem = NULL;
+    return 0;
+}
+static ABI int32_t posix_sem_wait(void *sem) {
+    sem_t *host = guest_sem(sem);
+    if (!host) return fail_posix(EINVAL);
+    while (sem_wait(host)) if (errno != EINTR) return fail_posix(errno);
+    return 0;
+}
+static ABI int32_t posix_sem_trywait(void *sem) {
+    sem_t *host = guest_sem(sem);
+    if (!host) return fail_posix(EINVAL);
+    return sem_trywait(host) ? fail_posix(errno) : 0;
+}
+/* The deadline is an absolute CLOCK_REALTIME time, converted field by field (Windows' timespec
+ * has a 32-bit tv_nsec). */
+/* bbport-dmc-winsem: winpthreads' sem_timedwait rounds a timeout up to the system timer tick:
+ * a deadline that has already passed (a poll) or lies 5 ms ahead still waited 10-19 ms. DmC's Bink
+ * sound thread paces the video with such polls, so Bink cutscenes ran at 8 FPS on Windows
+ * (BB_SEM_TRACE: deadline 0.000 ms ahead, waited ~15 ms, timed out). On Windows: try at once, poll
+ * the last 20 ms with high-resolution sleeps, and block in sem_timedwait only until 20 ms before a
+ * farther deadline. */
+static int dmc_sem_timedwait(sem_t *host, const struct timespec *ts) {
+#ifdef _WIN32
+    for (unsigned round = 0;; ++round) {
+        if (!sem_trywait(host)) return 0;
+        if (errno != EAGAIN && errno != EBUSY && errno != EINTR) return -1;
+        struct timespec now;
+        clock_gettime(CLOCK_REALTIME, &now);
+        const int64_t left = (int64_t)(ts->tv_sec - now.tv_sec) * 1000000000 + (int64_t)(ts->tv_nsec - now.tv_nsec);
+        if (left <= 0) { errno = ETIMEDOUT; return -1; }
+        if (left > 20000000) {   /* far deadline: block until 20 ms before it */
+            const int64_t until = (int64_t)now.tv_sec * 1000000000 + now.tv_nsec + left - 20000000;
+            struct timespec early = { (time_t)(until / 1000000000), (long)(until % 1000000000) };
+            if (!sem_timedwait(host, &early)) return 0;
+            if (errno != ETIMEDOUT && errno != EINTR) return -1;
+            continue;
+        }
+        compat_sleep_ns(round < 16 ? 50000 : (uint64_t)(left < 500000 ? left : 500000));
+    }
+#else
+    int r;
+    while ((r = sem_timedwait(host, ts)) && errno == EINTR) {}
+    return r;
+#endif
+}
+static ABI int32_t posix_sem_timedwait(void *sem, const DmcGuestTimespec *deadline) {
+    sem_t *host = guest_sem(sem);
+    if (!host || !deadline) return fail_posix(EINVAL);
+    struct timespec ts;
+    ts.tv_sec = (time_t)deadline->sec;
+    ts.tv_nsec = (long)deadline->nsec;
+    /* bbport-dmc-semtrace: BB_SEM_TRACE=1 prints, for the first calls and every 500th, how far
+     * the deadline lies from the host's CLOCK_REALTIME, how long the wait took and how it ended. */
+    static int trace = -1;
+    if (trace < 0) { const char *e = getenv("BB_SEM_TRACE"); trace = e && e[0] == '1'; }
+    struct timespec t0 = {0, 0};
+    if (trace) clock_gettime(CLOCK_REALTIME, &t0);
+    int r;
+    r = dmc_sem_timedwait(host, &ts);
+    const int err = r ? errno : 0;
+    if (trace) {
+        static atomic_int calls;
+        const int k = atomic_fetch_add(&calls, 1);
+        if (k < 80 || k % 500 == 0) {
+            struct timespec t1;
+            clock_gettime(CLOCK_REALTIME, &t1);
+            const double ahead = (double)(ts.tv_sec - t0.tv_sec) * 1e3 + (double)(ts.tv_nsec - t0.tv_nsec) / 1e6;
+            const double waited = (double)(t1.tv_sec - t0.tv_sec) * 1e3 + (double)(t1.tv_nsec - t0.tv_nsec) / 1e6;
+            printf("SemTrace #%d: deadline %.3f ms ahead (guest %lld.%09lld), waited %.3f ms, %s\n", k, ahead,
+                   (long long)deadline->sec, (long long)deadline->nsec, waited,
+                   !err ? "posted" : err == ETIMEDOUT ? "timed out" : "error");
+        }
+    }
+    return r ? fail_posix(err) : 0;
+}
+static ABI int32_t posix_sem_post(void *sem) {
+    sem_t *host = guest_sem(sem);
+    if (!host) return fail_posix(EINVAL);
+    return sem_post(host) ? fail_posix(errno) : 0;
+}
+static ABI int32_t posix_sem_getvalue(void *sem, int32_t *value) {
+    sem_t *host = guest_sem(sem);
+    if (!host || !value) return fail_posix(EINVAL);
+    int v = 0;
+    if (sem_getvalue(host, &v)) return fail_posix(errno);
+    *value = v;
+    return 0;
+}
+
+#define DMC_NP_SIGNED_OUT ((int32_t)0x80550006)
+#define DMC_LOG(name) do { static int n_; if (n_ < 4) { n_++; printf("Runtime: dmc-stub %s\n", name); } } while (0)
+/* NP: an offline console, signed out. */
+static ABI int32_t dmc_np_signed_out(void) { DMC_LOG("NP call -> SIGNED_OUT"); return DMC_NP_SIGNED_OUT; }
+static ABI int32_t dmc_np_ok(void) { DMC_LOG("NP cleanup -> 0"); return 0; }
+static ABI int32_t dmc_np_get_account_id(int32_t user, uint64_t *account) {
+    DMC_LOG("sceNpGetAccountId -> SIGNED_OUT");
+    (void)user;
+    if (account) *account = 0;
+    return DMC_NP_SIGNED_OUT;
+}
+static ABI int32_t dmc_np_new_id(void) {   /* contexts/requests/handles: a positive id */
+    static atomic_int next = 1;
+    DMC_LOG("NP create -> id");
+    return atomic_fetch_add(&next, 1);
+}
+/* libSceNgs2: fake handles, silent rendering (the game's sound goes through AudioOut + Ajm). */
+typedef struct { void *buffer; size_t size; uint32_t waveform_type; uint32_t channels; } DmcNgs2RenderBuffer;
+static ABI int32_t dmc_ngs2_system_create(const void *option, const void *allocator, uint64_t *handle) {
+    (void)option; (void)allocator;
+    DMC_LOG("sceNgs2SystemCreateWithAllocator (silent)");
+    if (handle) *handle = 0x4e475332; /* "NGS2" */
+    return 0;
+}
+static ABI int32_t dmc_ngs2_rack_create(uint64_t system, uint32_t rack_id, const void *option,
+                                        const void *allocator, uint64_t *handle) {
+    (void)system; (void)option; (void)allocator;
+    static uint64_t next = 0x52000000; /* "R" */
+    DMC_LOG("sceNgs2RackCreateWithAllocator");
+    if (handle) *handle = next++ + ((uint64_t)rack_id << 8);
+    return 0;
+}
+static ABI int32_t dmc_ngs2_rack_voice(uint64_t rack, uint32_t index, uint64_t *handle) {
+    if (handle) *handle = (rack << 16) | (index + 1);
+    return 0;
+}
+static ABI int32_t dmc_ngs2_voice_flags(uint64_t voice, uint32_t *flags) {
+    (void)voice;
+    if (flags) *flags = 0; /* not playing */
+    return 0;
+}
+static ABI int32_t dmc_ngs2_render(uint64_t system, DmcNgs2RenderBuffer *buffers, uint32_t count) {
+    (void)system;
+    for (uint32_t i = 0; buffers && i < count; i++)
+        if (buffers[i].buffer && buffers[i].size) memset(buffers[i].buffer, 0, buffers[i].size);
+    return 0;
+}
+static ABI int32_t dmc_ngs2_ok(void) { return 0; }
+static ABI int32_t dmc_ngs2_parse_waveform(const void *data, size_t size, void *info) {
+    (void)data; (void)size; (void)info;
+    DMC_LOG("sceNgs2ParseWaveformData -> error (no decoder yet)");
+    return (int32_t)0x804A0000; /* libSceNgs2 error facility; exact code not verified */
+}
+/* Common dialogs nobody needs offline: open, finish at once, "user cancelled". */
+static ABI int32_t dmc_dialog_ok(void) { DMC_LOG("dialog -> 0"); return 0; }
+static ABI int32_t dmc_dialog_finished(void) { return 3; /* SCE_COMMON_DIALOG_STATUS_FINISHED */ }
+static ABI int32_t dmc_dialog_result(int32_t *result) {
+    if (result) *result = 1; /* SCE_COMMON_DIALOG_RESULT_USER_CANCELED */
+    return 0;
+}
+/* System service / app content. */
+typedef struct { float ratio; uint8_t reserved[128]; } DmcSafeArea;
+static ABI int32_t dmc_safe_area(DmcSafeArea *info) {
+    DMC_LOG("sceSystemServiceGetDisplaySafeAreaInfo -> 1.0");
+    if (!info) return (int32_t)0x80A10003;
+    memset(info, 0, sizeof(*info));
+    info->ratio = 1.0f;
+    return 0;
+}
+static ABI int32_t dmc_temp_mount2(uint32_t option, char *mount_point) {
+    (void)option;
+    DMC_LOG("sceAppContentTemporaryDataMount2 -> /temp0");
+    if (mount_point) strcpy(mount_point, "/temp0"); /* SceAppContentMountPoint: char[16] */
+    return 0;
+}
+static ABI int32_t dmc_ok(void) { DMC_LOG("setter/no-op -> 0"); return 0; }
+static ABI int32_t dmc_no_socket(void) { DMC_LOG("accept/recv -> EBADF"); return fail_posix(EBADF); }
+static ABI int32_t dmc_trophy_unlock_state(int32_t context, int32_t handle, uint32_t *flags, uint32_t *count) {
+    (void)context; (void)handle;
+    DMC_LOG("sceNpTrophyGetTrophyUnlockState -> none unlocked");
+    if (flags) memset(flags, 0, 4 * sizeof(uint32_t));
+    if (count) *count = 0;
+    return 0;
+}
+
 static const RuntimeExport exports[]={
+    /* ---- bbport-dmc ---- */
+    {"sceKernelSetVirtualRangeName",kernel_set_virtual_range_name},
+    {"sceKernelLoadStartModule",kernel_load_start_module},
+    {"sem_init",posix_sem_init}, {"sem_destroy",posix_sem_destroy}, {"sem_wait",posix_sem_wait},
+    {"sem_trywait",posix_sem_trywait}, {"sem_timedwait",posix_sem_timedwait},
+    {"sem_post",posix_sem_post}, {"sem_getvalue",posix_sem_getvalue},
+    {"sceNpGetAccountId",dmc_np_get_account_id},
+    {"sceNpTusCreateNpTitleCtx",dmc_np_new_id}, {"sceNpTssCreateNpTitleCtx",dmc_np_new_id},
+    {"sceNpTusCreateRequest",dmc_np_new_id}, {"sceNpTusDeleteNpTitleCtx",dmc_np_ok},
+    {"sceNpTusDeleteRequest",dmc_np_ok}, {"sceNpTusAbortRequest",dmc_np_ok},
+    {"sceNpTusPollAsync",dmc_np_signed_out}, {"sceNpTusGetDataAsync",dmc_np_signed_out},
+    {"sceNpTusSetDataAsync",dmc_np_signed_out}, {"sceNpTssGetDataAsync",dmc_np_signed_out},
+    {"sceNpTusGetMultiSlotVariableAsync",dmc_np_signed_out},
+    {"sceNpTusSetMultiSlotVariableAsync",dmc_np_signed_out},
+    {"sceNpInGameMessageInitialize",dmc_np_new_id}, {"sceNpInGameMessageCreateHandle",dmc_np_new_id},
+    {"sceNpInGameMessagePrepare",dmc_np_signed_out}, {"sceNpInGameMessageSendData",dmc_np_signed_out},
+    {"sceNpInGameMessageDeleteHandle",dmc_np_ok}, {"sceNpInGameMessageTerminate",dmc_np_ok},
+    {"sceNpLookupCreateRequest",dmc_np_new_id}, {"sceNpLookupWaitAsync",dmc_np_signed_out},
+    {"sceNpBandwidthTestInitStart",dmc_np_signed_out}, {"sceNpBandwidthTestGetStatus",dmc_np_signed_out},
+    {"sceNpBandwidthTestAbort",dmc_np_ok}, {"sceNpBandwidthTestShutdown",dmc_np_signed_out},
+    {"sceNgs2SystemCreateWithAllocator",dmc_ngs2_system_create},
+    {"sceNgs2RackCreateWithAllocator",dmc_ngs2_rack_create},
+    {"sceNgs2RackGetVoiceHandle",dmc_ngs2_rack_voice}, {"sceNgs2VoiceGetStateFlags",dmc_ngs2_voice_flags},
+    {"sceNgs2SystemRender",dmc_ngs2_render}, {"sceNgs2VoiceControl",dmc_ngs2_ok},
+    {"sceNgs2RackDestroy",dmc_ngs2_ok}, {"sceNgs2SystemDestroy",dmc_ngs2_ok},
+    {"sceNgs2ParseWaveformData",dmc_ngs2_parse_waveform},
+    {"sceNpFriendListDialogInitialize",dmc_dialog_ok}, {"sceNpFriendListDialogOpen",dmc_dialog_ok},
+    {"sceNpFriendListDialogUpdateStatus",dmc_dialog_finished},
+    {"sceNpFriendListDialogGetResult",dmc_dialog_result}, {"sceNpFriendListDialogTerminate",dmc_dialog_ok},
+    {"sceGameCustomDataDialogInitialize",dmc_dialog_ok}, {"sceGameCustomDataDialogOpen",dmc_dialog_ok},
+    {"sceGameCustomDataDialogUpdateStatus",dmc_dialog_finished},
+    {"sceGameCustomDataDialogGetResult",dmc_dialog_result}, {"sceGameCustomDataDialogTerminate",dmc_dialog_ok},
+    {"sceSystemServiceGetDisplaySafeAreaInfo",dmc_safe_area},
+    {"sceSystemServiceShowDisplaySafeAreaSettings",dmc_ok},
+    {"sceAppContentTemporaryDataMount2",dmc_temp_mount2}, {"sceAppContentTemporaryDataFormat",dmc_ok},
+    {"sceVoiceSetMuteFlag",dmc_ok}, {"sceVoiceSetVolume",dmc_ok}, {"scePadSetLightBar",dmc_ok},
+    {"sceKernelUtimes",dmc_ok}, {"msync",dmc_ok},
+    {"accept",dmc_no_socket}, {"recv",dmc_no_socket},
+    {"sceNpTrophyGetTrophyUnlockState",dmc_trophy_unlock_state}, {"sceNpTrophyAbortHandle",dmc_ok},
     {"sceKernelIsNeoMode",is_neo_mode}, {"sceKernelGetCpumode",get_cpumode}, {"sceKernelGetCurrentCpu",get_current_cpu},
     {"sceRandomGetRandomNumber",random_number},
     {"scePthreadCondattrInit",condattr_init}, {"scePthreadCondattrDestroy",condattr_destroy},
